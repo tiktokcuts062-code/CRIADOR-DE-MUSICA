@@ -4320,14 +4320,44 @@ function semiToNoteName(semi){
  return FLAT_NOTE_NAMES[pc] + octave;
 }
 
-function loadInstrumentSample(folder, noteName){
+/* ---------- FILA COM LIMITE DE CARREGAMENTOS SIMULTÂNEOS ----------
+ Antes, trocar de instrumento (ou clicar em "Randomizar remix", que troca
+ os 6 instrumentos de uma vez) disparava até ~250 fetch()+decodeAudioData()
+ simultâneos - isso é o que travava a página inteira por vários segundos.
+ Agora só MAX_CONCURRENT_SAMPLE_LOADS carregam por vez; o resto espera na
+ fila, e pedidos "urgentes" (uma nota que precisa tocar JÁ, durante o play)
+ furam a fila na frente dos pré-carregamentos em segundo plano. */
+const MAX_CONCURRENT_SAMPLE_LOADS = 4;
+let activeSampleLoads = 0;
+const sampleLoadQueue = [];
+function runNextSampleLoad(){
+ while(activeSampleLoads < MAX_CONCURRENT_SAMPLE_LOADS && sampleLoadQueue.length > 0){
+ const job = sampleLoadQueue.shift();
+ activeSampleLoads++;
+ job().finally(()=>{ activeSampleLoads--; runNextSampleLoad(); });
+ }
+}
+function queueSampleLoad(fn, priority){
+ return new Promise(resolve=>{
+ const job = ()=> fn().then(resolve, resolve);
+ if(priority) sampleLoadQueue.unshift(job); else sampleLoadQueue.push(job);
+ runNextSampleLoad();
+ });
+}
+function loadInstrumentSample(folder, noteName, priority){
  const key = folder+'/'+noteName;
  if(!(key in sampleCache)){
  const url = SOUNDFONT_BASE + folder + '-mp3/' + noteName + '.mp3';
- sampleCache[key] = fetch(url)
+ sampleCache[key] = queueSampleLoad(()=>
+ fetch(url)
  .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.arrayBuffer(); })
  .then(buf=>audioCtx.decodeAudioData(buf))
- .catch(err=>{ console.warn('[amostra real] não consegui carregar', url, err); return null; });
+ .catch(err=>{ console.warn('[amostra real] não consegui carregar', url, err); return null; }),
+ priority
+ );
+ } else if(priority){
+ // já estava na fila/carregando em segundo plano: não fura a fila de novo,
+ // só devolve a mesma promise (evita pedir o mesmo arquivo duas vezes)
  }
  return sampleCache[key];
 }
@@ -4341,7 +4371,7 @@ function preloadDrumSample(folder, noteName){ loadInstrumentSample(folder, noteN
 
 // toca uma nota melódica (baixo/lead) usando a amostra real mais próxima
 function playMelodicSample(folder, time, duration, semi, dest, gainMul){
- loadInstrumentSample(folder, semiToNoteName(semi)).then(buffer=>{
+ loadInstrumentSample(folder, semiToNoteName(semi), true).then(buffer=>{
  if(!buffer) return;
  const startAt = Math.max(time, audioCtx.currentTime);
  const src = audioCtx.createBufferSource(); src.buffer = buffer;
@@ -4357,7 +4387,7 @@ function playMelodicSample(folder, time, duration, semi, dest, gainMul){
 }
 // toca uma percussão real (kick/snare/hat) numa nota fixa do kit acústico
 function playDrumSample(folder, noteName, time, dest, gainMul){
- loadInstrumentSample(folder, noteName).then(buffer=>{
+ loadInstrumentSample(folder, noteName, true).then(buffer=>{
  if(!buffer) return;
  const startAt = Math.max(time, audioCtx.currentTime);
  const src = audioCtx.createBufferSource(); src.buffer = buffer;
